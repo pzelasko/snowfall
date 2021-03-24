@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import List
 from typing import Union
 
-from lhotse import CutSet
+from lhotse import CutSet, Fbank
 from lhotse.dataset import K2SpeechRecognitionDataset, SingleCutSampler
+from lhotse.dataset.input_strategies import OnTheFlyFeatures
+from lhotse.utils import fastcopy
 from snowfall.common import average_checkpoint
 from snowfall.common import find_first_disambig_symbol
 from snowfall.common import get_texts
@@ -25,8 +27,8 @@ from snowfall.common import load_checkpoint
 from snowfall.common import setup_logger
 from snowfall.decoding.graph import compile_HLG
 from snowfall.models import AcousticModel
-from snowfall.models.transformer import Transformer
 from snowfall.models.conformer import Conformer
+from snowfall.models.transformer import Transformer
 from snowfall.training.ctc_graph import build_ctc_topo
 from snowfall.training.mmi_graph import create_bigram_phone_lm
 from snowfall.training.mmi_graph import get_phone_symbols
@@ -194,6 +196,11 @@ def get_parser():
         type=int,
         default=256,
         help="Number of units in transformer attention layers.")
+    parser.add_argument(
+        '--language',
+        default='Igbo',
+        help='Which BABEL language to use.'
+    )
     return parser
 
 
@@ -205,12 +212,13 @@ def main():
     max_duration = args.max_duration
     avg = args.avg
     att_rate = args.att_rate
+    language = args.language
 
     exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan')
     setup_logger('{}/log/log-decode'.format(exp_dir), log_level='debug')
 
     # load L, G, symbol_table
-    lang_dir = Path('data/lang_nosp')
+    lang_dir = Path(f'data/lang_mono/{language}')
     symbol_table = k2.SymbolTable.from_file(lang_dir / 'words.txt')
     phone_symbol_table = k2.SymbolTable.from_file(lang_dir / 'phones.txt')
 
@@ -267,33 +275,48 @@ def main():
     P.set_scores_stochastic_(model.P_scores)
     print_transition_probabilities(P, phone_symbol_table, phone_ids, filename='P_scores.txt')
 
-    if not os.path.exists(lang_dir / 'HLG.pt'):
+    data_dir = Path(f'exp/data/{language}')
+    if not os.path.exists(data_dir / 'HLG.pt'):
         logging.debug("Loading L_disambig.fst.txt")
         with open(lang_dir / 'L_disambig.fst.txt') as f:
             L = k2.Fsa.from_openfst(f.read(), acceptor=False)
         logging.debug("Loading G.fst.txt")
-        with open(lang_dir / 'G.fst.txt') as f:
+        with open(data_dir / 'G.fst.txt') as f:
             G = k2.Fsa.from_openfst(f.read(), acceptor=False)
         first_phone_disambig_id = find_first_disambig_symbol(phone_symbol_table)
         first_word_disambig_id = find_first_disambig_symbol(symbol_table)
         HLG = compile_HLG(L=L,
-                         G=G,
-                         H=ctc_topo,
-                         labels_disambig_id_start=first_phone_disambig_id,
-                         aux_labels_disambig_id_start=first_word_disambig_id)
-        torch.save(HLG.as_dict(), lang_dir / 'HLG.pt')
+                          G=G,
+                          H=ctc_topo,
+                          labels_disambig_id_start=first_phone_disambig_id,
+                          aux_labels_disambig_id_start=first_word_disambig_id)
+        torch.save(HLG.as_dict(), data_dir / 'HLG.pt')
     else:
         logging.debug("Loading pre-compiled HLG")
-        d = torch.load(lang_dir / 'HLG.pt')
+        d = torch.load(data_dir / 'HLG.pt')
         HLG = k2.Fsa.from_dict(d)
+
+    def is_not_silence(cut):
+        return all(cut.supervisions[0].text != tok for tok in ['<silence>', '<sil>'])
+
+    def remove_overlapping_sups(cut):
+        return fastcopy(cut, supervisions=[cut.supervisions[0]])
 
     # load dataset
     feature_dir = Path('exp/data')
     logging.debug("About to get test cuts")
-    cuts_test = CutSet.from_json(feature_dir / 'cuts_test-clean.json.gz')
+    cuts_test = (
+        CutSet.from_json(feature_dir / language / 'cuts_dev.json')
+            .trim_to_supervisions()
+            .filter(is_not_silence)
+            .map(remove_overlapping_sups)
+    )
 
     logging.debug("About to create test dataset")
-    test = K2SpeechRecognitionDataset(cuts_test)
+    test = K2SpeechRecognitionDataset(
+        cuts=cuts_test,
+        input_strategy=OnTheFlyFeatures(Fbank())
+    )
     sampler = SingleCutSampler(cuts_test, max_duration=max_duration)
     logging.debug("About to create test dataloader")
     test_dl = torch.utils.data.DataLoader(test, batch_size=None, sampler=sampler, num_workers=1)

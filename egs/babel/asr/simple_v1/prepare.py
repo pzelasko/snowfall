@@ -111,7 +111,12 @@ def main():
             cuts_path = output_dir / lang / f'cuts_{split}.json'
             if not cuts_path.is_file():
                 logging.info(f'\t- {lang} : {split}')
-                babel_cuts[lang][split] = CutSet.from_manifests(**manifests)
+                babel_cuts[lang][split] = CutSet.from_manifests(
+                    recordings=manifests['recordings'],
+                    supervisions=manifests['supervisions'].filter(
+                        lambda s: s.text != '<silence>'  # discard non-speech segments
+                    )
+                )
                 babel_cuts[lang][split].to_json(cuts_path)
             else:
                 babel_cuts[lang][split] = load_manifest(cuts_path)
