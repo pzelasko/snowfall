@@ -1,10 +1,7 @@
 #!/usr/bin/env python
-from itertools import chain
-
-from pathlib import Path
-
 import subprocess
-
+from itertools import chain
+from pathlib import Path
 
 BABEL_ROOT = Path("/export/common/data/corpora/babel_CLSP")
 
@@ -48,11 +45,19 @@ BABEL_LEXICON_PATHS = {
 for key in BABEL_LEXICON_PATHS:
     BABEL_LEXICON_PATHS[key] = BABEL_ROOT / BABEL_LEXICON_PATHS[key]
 
+
+def needs_romanized_flag(lang: str) -> bool:
+    return lang in [
+        'Amharic', 'Assamese', 'Bengali', 'Cantonese', 'Kazakh', 'Lao', 'Mongolian', 'Pashto', 'Tamil', 'Teluhu'
+    ]
+
+
 # Create monolingual lexicons
 Path('data/dict_mono').mkdir(parents=True, exist_ok=True)
 for lang, path in BABEL_LEXICON_PATHS.items():
     print(f'Creating dict for {lang}')
-    subprocess.run(f'local/convert_babel_lexicon.pl {path} data/dict_mono/{lang}', shell=True, text=True)
+    romanized = '--romanized' if needs_romanized_flag(lang) else ''
+    subprocess.run(f'local/convert_babel_lexicon.pl {romanized} {path} data/dict_mono/{lang}', shell=True, text=True)
 
 # Create multilingual lexicon
 lexicons = {}
