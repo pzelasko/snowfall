@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c)  2021  John's Hopkins University (authors: Piotr Żelasko)
 # Apache 2.0
-from functools import reduce
 
 import logging
 import os
@@ -135,7 +134,9 @@ def main():
     if not musan_cuts_path.is_file():
         # create chunks of Musan with duration 5 - 10 seconds
         musan_cuts = CutSet.from_manifests(
-            recordings=combine(part['recordings'] for part in musan_manifests.values())
+            recordings=combine(
+                part['recordings'] for part in musan_manifests.values()
+            ).resample(8000)
         ).cut_into_windows(10.0).filter(lambda c: c.duration > 5)
         musan_cuts.to_json(musan_cuts_path)
 
