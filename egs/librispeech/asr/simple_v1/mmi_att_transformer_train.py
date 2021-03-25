@@ -21,9 +21,9 @@ from torch.nn.utils import clip_grad_value_
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Optional, Tuple
 
-from lhotse import CutSet, Fbank, load_manifest
-from lhotse.dataset import BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, SingleCutSampler
-from lhotse.dataset.cut_transforms.perturb_speed import PerturbSpeed
+from lhotse import Fbank, load_manifest
+from lhotse.dataset import BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, SingleCutSampler, \
+    SpecAugment
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
 from lhotse.utils import fix_random_seed
 from snowfall.common import describe, str2bool
@@ -456,7 +456,7 @@ def main():
 
     fix_random_seed(42)
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan')
+    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-specaug')
     setup_logger('{}/log/log-train'.format(exp_dir))
     tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
 
@@ -513,7 +513,13 @@ def main():
         # Cut concatenation should be the first transform in the list,
         # so that if we e.g. mix noise in, it will fill the gaps between different utterances.
         transforms = [CutConcatenate(duration_factor=args.duration_factor, gap=args.gap)] + transforms
-    train = K2SpeechRecognitionDataset(cuts_train, cut_transforms=transforms)
+    train = K2SpeechRecognitionDataset(
+        cuts_train,
+        cut_transforms=transforms,
+        input_transforms=[
+            SpecAugment(num_frame_masks=2, features_mask_size=4, num_feature_masks=2, frames_mask_size=35)
+        ]
+    )
 
     if args.on_the_fly_feats:
         # NOTE: the PerturbSpeed transform should be added only if we remove it from data prep stage.
