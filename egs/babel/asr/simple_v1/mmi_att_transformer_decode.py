@@ -19,7 +19,6 @@ from typing import Union
 from lhotse import CutSet, Fbank
 from lhotse.dataset import K2SpeechRecognitionDataset, SingleCutSampler
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
-from lhotse.utils import fastcopy
 from snowfall.common import average_checkpoint
 from snowfall.common import find_first_disambig_symbol
 from snowfall.common import get_texts
@@ -214,7 +213,7 @@ def main():
     att_rate = args.att_rate
     language = args.language
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan')
+    exp_dir = Path(f'exp-{model_type}-{language}')
     setup_logger('{}/log/log-decode'.format(exp_dir), log_level='debug')
 
     # load L, G, symbol_table
@@ -296,20 +295,12 @@ def main():
         d = torch.load(data_dir / 'HLG.pt')
         HLG = k2.Fsa.from_dict(d)
 
-    def is_not_silence(cut):
-        return all(cut.supervisions[0].text != tok for tok in ['<silence>', '<sil>'])
-
-    def remove_overlapping_sups(cut):
-        return fastcopy(cut, supervisions=[cut.supervisions[0]])
-
     # load dataset
     feature_dir = Path('exp/data')
     logging.debug("About to get test cuts")
     cuts_test = (
         CutSet.from_json(feature_dir / language / 'cuts_dev.json')
             .trim_to_supervisions()
-            .filter(is_not_silence)
-            .map(remove_overlapping_sups)
     )
 
     logging.debug("About to create test dataset")

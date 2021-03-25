@@ -21,11 +21,11 @@ from torch.nn.utils import clip_grad_value_
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Optional, Tuple
 
-from lhotse import CutSet, Fbank, SupervisionSegment
+from lhotse import CutSet, Fbank
 from lhotse.dataset import BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, SingleCutSampler
 from lhotse.dataset.cut_transforms.perturb_speed import PerturbSpeed
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
-from lhotse.utils import fastcopy, fix_random_seed
+from lhotse.utils import fix_random_seed
 from snowfall.common import describe, str2bool
 from snowfall.common import load_checkpoint, save_checkpoint
 from snowfall.common import save_training_info
@@ -462,7 +462,7 @@ def main():
 
     fix_random_seed(42)
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan')
+    exp_dir = Path(f'exp-{model_type}-{language}')
     setup_logger('{}/log/log-train'.format(exp_dir))
     tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
 
@@ -497,30 +497,20 @@ def main():
     P.scores = torch.zeros_like(P.scores)
     P = P.to(device)
 
-    def is_not_silence(cut):
-        return all(cut.supervisions[0].text != tok for tok in ['<silence>', '<sil>'])
-
-    def remove_overlapping_sups(cut):
-        return fastcopy(cut, supervisions=[cut.supervisions[0]])
-
     # load dataset
     feature_dir = Path('exp/data')
     logging.info("About to get train cuts")
     cuts_train = (
-        CutSet.from_json(feature_dir / language / 'cuts_train.json')
+        CutSet.from_json(feature_dir / language / 'cuts_train.json.gz')
             .trim_to_supervisions()
-            .filter(is_not_silence)
-            .map(remove_overlapping_sups)
     )
     logging.info("About to get dev cuts")
     cuts_dev = (
-        CutSet.from_json(feature_dir / language / 'cuts_dev.json')
+        CutSet.from_json(feature_dir / language / 'cuts_dev.json.gz')
             .trim_to_supervisions()
-            .filter(is_not_silence)
-            .map(remove_overlapping_sups)
     )
     logging.info("About to get Musan cuts")
-    cuts_musan = CutSet.from_json(feature_dir / 'cuts_musan.json')
+    cuts_musan = CutSet.from_json(feature_dir / 'cuts_musan.json.gz')
 
     logging.info("About to create train dataset")
     transforms = [CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20))]
@@ -616,7 +606,7 @@ def main():
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers)
-            
+
     model.P_scores = nn.Parameter(P.scores.clone(), requires_grad=True)
 
     model.to(device)

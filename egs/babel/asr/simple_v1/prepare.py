@@ -108,7 +108,7 @@ def main():
     for lang, lang_manifests in babel_manifests.items():
         babel_cuts[lang] = {}
         for split, manifests in lang_manifests.items():
-            cuts_path = output_dir / lang / f'cuts_{split}.json'
+            cuts_path = output_dir / lang / f'cuts_{split}.json.gz'
             if not cuts_path.is_file():
                 logging.info(f'\t- {lang} : {split}')
                 babel_cuts[lang][split] = CutSet.from_manifests(
@@ -135,7 +135,7 @@ def main():
             ), CutSet({}))
             multilingual_cuts.to_json(cuts_path)
 
-    musan_cuts_path = output_dir / 'cuts_musan.json'
+    musan_cuts_path = output_dir / 'cuts_musan.json.gz'
     if not musan_cuts_path.is_file():
         # create chunks of Musan with duration 5 - 10 seconds
         musan_cuts = CutSet.from_manifests(
