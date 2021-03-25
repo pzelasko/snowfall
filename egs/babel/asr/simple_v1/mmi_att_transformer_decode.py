@@ -78,9 +78,11 @@ def decode(dataloader: torch.utils.data.DataLoader, model: AcousticModel,
         hyps = get_texts(best_paths, indices)
         assert len(hyps) == len(texts)
 
+        # TODO: more systematic way of normalizing the reference transcripts for scoring
+        skip_words = {'<laugh>', '<laughter>', '<noise>', '<v-noise>', '<silence>'}
         for i in range(len(texts)):
-            hyp_words = [symbols.get(x) for x in hyps[i]]
-            ref_words = texts[i].split(' ')
+            hyp_words = [w for w in (symbols.get(x) for x in hyps[i]) if w not in skip_words]
+            ref_words = [w for w in texts[i].split(' ') if w not in skip_words]
             results.append((ref_words, hyp_words))
 
         if batch_idx % 10 == 0:
