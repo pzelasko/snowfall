@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import List
 from typing import Union
 
-from lhotse import CutSet
+from lhotse import CutSet, load_manifest
 from lhotse.dataset import K2SpeechRecognitionDataset, SingleCutSampler
-from snowfall.common import average_checkpoint
+from snowfall.common import average_checkpoint, store_transcripts
 from snowfall.common import find_first_disambig_symbol
 from snowfall.common import get_texts
+from snowfall.common import write_error_stats
 from snowfall.common import load_checkpoint
 from snowfall.common import setup_logger
 from snowfall.decoding.graph import compile_HLG
@@ -206,7 +207,7 @@ def main():
     avg = args.avg
     att_rate = args.att_rate
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan')
+    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa')
     setup_logger('{}/log/log-decode'.format(exp_dir), log_level='debug')
 
     # load L, G, symbol_table
@@ -232,7 +233,7 @@ def main():
 
     if model_type == "transformer":
         model = Transformer(
-            num_features=40,
+            num_features=80,
             nhead=args.nhead,
             d_model=args.attention_dim,
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
@@ -240,7 +241,7 @@ def main():
             num_decoder_layers=num_decoder_layers)
     else:
         model = Conformer(
-            num_features=40,
+            num_features=80,
             nhead=args.nhead,
             d_model=args.attention_dim,
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
@@ -287,49 +288,45 @@ def main():
         d = torch.load(lang_dir / 'HLG.pt')
         HLG = k2.Fsa.from_dict(d)
 
-    # load dataset
-    feature_dir = Path('exp/data')
-    logging.debug("About to get test cuts")
-    cuts_test = CutSet.from_json(feature_dir / 'cuts_test-clean.json.gz')
-
-    logging.debug("About to create test dataset")
-    test = K2SpeechRecognitionDataset(cuts_test)
-    sampler = SingleCutSampler(cuts_test, max_duration=max_duration)
-    logging.debug("About to create test dataloader")
-    test_dl = torch.utils.data.DataLoader(test, batch_size=None, sampler=sampler, num_workers=1)
-
-    #  if not torch.cuda.is_available():
-    #  logging.error('No GPU detected!')
-    #  sys.exit(-1)
-
     logging.debug("convert HLG to device")
     HLG = HLG.to(device)
     HLG.aux_labels = k2.ragged.remove_values_eq(HLG.aux_labels, 0)
     HLG.requires_grad_(False)
-    logging.debug("About to decode")
-    results = decode(dataloader=test_dl,
-                     model=model,
-                     device=device,
-                     HLG=HLG,
-                     symbols=symbol_table)
-    s = ''
-    for ref, hyp in results:
-        s += f'ref={ref}\n'
-        s += f'hyp={hyp}\n'
-    logging.info(s)
-    # compute WER
-    dists = [edit_distance(r, h) for r, h in results]
-    errors = {
-        key: sum(dist[key] for dist in dists)
-        for key in ['sub', 'ins', 'del', 'total']
-    }
-    total_words = sum(len(ref) for ref, _ in results)
-    # Print Kaldi-like message:
-    # %WER 8.20 [ 4459 / 54402, 695 ins, 427 del, 3337 sub ]
-    logging.info(
-        f'%WER {errors["total"] / total_words:.2%} '
-        f'[{errors["total"]} / {total_words}, {errors["ins"]} ins, {errors["del"]} del, {errors["sub"]} sub ]'
-    )
+
+    # load dataset
+    feature_dir = Path('exp/data')
+    test_sets = ['test-clean', 'test-other']
+    for test_set in test_sets:
+        logging.info(f'* DECODING: {test_set}')
+
+        logging.debug("About to get test cuts")
+        cuts_test = load_manifest(feature_dir / f'cuts_{test_set}.json.gz')
+        logging.debug("About to create test dataset")
+        from lhotse.dataset.input_strategies import OnTheFlyFeatures
+        from lhotse import Fbank, FbankConfig
+        test = K2SpeechRecognitionDataset(cuts_test, input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))))
+        sampler = SingleCutSampler(cuts_test, max_duration=max_duration)
+        logging.debug("About to create test dataloader")
+        test_dl = torch.utils.data.DataLoader(test, batch_size=None, sampler=sampler, num_workers=1)
+
+        logging.debug("About to decode")
+        results = decode(dataloader=test_dl,
+                         model=model,
+                         device=device,
+                         HLG=HLG,
+                         symbols=symbol_table)
+
+        recog_path = exp_dir / f'recogs-{test_set}.txt'
+        store_transcripts(path=recog_path, texts=results)
+        logging.info(f'The transcripts are stored in {recog_path}')
+
+        # The following prints out WERs, per-word error statistics and aligned
+        # ref/hyp pairs.
+        errs_filename = exp_dir / f'errs-{test_set}.txt'
+        with open(errs_filename, 'w') as f:
+            write_error_stats(f, test_set, results)
+        logging.info('Wrote detailed error stats to {}'.format(errs_filename))
+
 
 
 torch.set_num_threads(1)
