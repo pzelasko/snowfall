@@ -1,7 +1,9 @@
 #!/usr/bin/env python
-import subprocess
+
 from itertools import chain
 from pathlib import Path
+
+from snowfall.bash import ParallelBash
 
 BABEL_ROOT = Path("/export/common/data/corpora/babel_CLSP")
 
@@ -53,15 +55,22 @@ def needs_romanized_flag(lang: str) -> bool:
 
 
 # Create monolingual lexicons
-Path('data/dict_mono').mkdir(parents=True, exist_ok=True)
+dict_mono = Path('data/dict_mono')
+dict_mono.mkdir(parents=True, exist_ok=True)
+bash = ParallelBash()
 for lang, path in BABEL_LEXICON_PATHS.items():
-    print(f'Creating dict for {lang}')
+    dict_mono_lang = dict_mono / lang
+    dict_mono_lang.mkdir(exist_ok=True)
     romanized = '--romanized' if needs_romanized_flag(lang) else ''
-    subprocess.run(f'local/convert_babel_lexicon.pl {romanized} {path} data/dict_mono/{lang}', shell=True, text=True)
+    bash.run(
+        cmd=f'local/convert_babel_lexicon.pl {romanized} {path} {dict_mono_lang}',
+        log_path=dict_mono_lang / 'prepare_dict.log'
+    )
+bash.join(msg='Preparing mono dicts')
 
 # Create multilingual lexicon
 lexicons = {}
-for lex_path in Path('data/dict_mono').rglob('lexicon.txt'):
+for lex_path in dict_mono.rglob('lexicon.txt'):
     lang = lex_path.parent.name
     lexicons[lang] = lex_path.read_text().splitlines()
     print(lang, len(lexicons[lang]))

@@ -3,7 +3,9 @@ import subprocess
 
 from pathlib import Path
 
-cmd_mono = """
+from snowfall.bash import ParallelBash
+
+CMD_MONO = """
 local/prepare_lang.sh \
   --position-dependent-phones false \
   data/dict_mono/{lang} \
@@ -12,17 +14,27 @@ local/prepare_lang.sh \
   data/lang_mono/{lang}
 """
 
-for lang in Path('data/dict_mono').glob('*'):
-    print(' '.join(cmd_mono.format(lang=lang.name).replace('\\', '').split()))
-    subprocess.run(cmd_mono.format(lang=lang.name), shell=True, text=True)
+bash = ParallelBash()
+dict_root = Path('data/dict_mono')
+lang_root = Path('data/lang_mono')
+for lang in dict_root.glob('*'):
+    print(' '.join(CMD_MONO.format(lang=lang.name).replace('\\', '').split()))
+    lang_dir = lang_root / lang.name
+    lang_dir.mkdir(exist_ok=True, parents=True)
+    bash.run(
+        cmd=CMD_MONO.format(lang=lang.name),
+        log_path=lang_dir / 'prepare_lang.log'
+    )
+bash.join()
 
-cmd_multi = """
+CMD_MULTI = """
 local/prepare_lang.sh \
   --position-dependent-phones false \
   data/dict_multi \
   "<unk>" \
-  data/local/lang_tmp/{lang} \
+  data/local/lang_multi_tmp/ \
   data/lang_multi
 """
 
-subprocess.run(cmd_multi, shell=True, text=True)
+bash.run(CMD_MULTI)
+bash.join()
