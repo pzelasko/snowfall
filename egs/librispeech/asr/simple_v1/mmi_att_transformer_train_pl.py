@@ -32,7 +32,8 @@ from snowfall.training.mmi_graph import create_bigram_phone_lm
 class LightningWrapper(pl.LightningModule):
     def __init__(self, model: AcousticModel, loss_fn: nn.Module, args: argparse.Namespace):
         super().__init__()
-        self.save_hyperparameters()
+        self.automatic_optimization = False
+        #self.save_hyperparameters()
         self.model = model
         self.loss_fn = loss_fn
         self.args = args
@@ -68,7 +69,7 @@ class LightningWrapper(pl.LightningModule):
         # nnet_output is [N, C, T]
         nnet_output = nnet_output.permute(0, 2, 1)  # now nnet_output is [N, T, C]
 
-        mmi_loss, tot_frames, all_frames = self.loss_fn(nnet_output, texts, supervision_segments)
+        mmi_loss, tot_frames, all_frames = self.loss_fn(nnet_output, texts, supervision_segments.to('cpu'))
 
         if is_training:
             # def maybe_log_gradients(tag: str):
@@ -83,6 +84,12 @@ class LightningWrapper(pl.LightningModule):
                 loss = (- (1.0 - self.args.att_rate) * mmi_loss + self.args.att_rate * att_loss) / len(texts)
             else:
                 loss = (-mmi_loss) / len(texts)
+
+            self.manual_backward(loss)
+            optim,  = self.optimizers(use_pl_optimizer=False)
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 5.0)
+            optim.step()
+            optim.zero_grad()
 
             self.loss_fn.P.set_scores_stochastic_(self.model.P_scores)
             # loss.backward()
@@ -104,7 +111,7 @@ class LightningWrapper(pl.LightningModule):
             #     optimizer.zero_grad()
 
         report_keys = {
-            'mmi_loss': mmi_loss
+            'mmi_loss': -mmi_loss
         }
         if is_training:
             report_keys['loss'] = loss
@@ -114,6 +121,9 @@ class LightningWrapper(pl.LightningModule):
             'tot_frames': tot_frames,
             'all_frames': all_frames
         })
+        for k, v in report_keys.items():
+            k = k if is_training else 'val_' + k
+            self.log(k, v, on_step=True, prog_bar=True, logger=True)
 
         return report_keys
 
@@ -140,7 +150,7 @@ class LightningWrapper(pl.LightningModule):
                          model_size=self.args.attention_dim,
                          factor=1.0,
                          warm_step=self.args.warm_step)
-        return optimizer
+        return {'optimizer': optimizer}
 
 
 def get_parser():
@@ -288,14 +298,14 @@ def main():
 
     trainer = pl.Trainer(
         default_root_dir=exp_dir,
-        gradient_clip_val=5.0,
         gpus=[device_id],
         accumulate_grad_batches=args.accum_grad,
         max_epochs=args.num_epochs,
         resume_from_checkpoint=exp_dir / 'last.pt',
         replace_sampler_ddp=False,
+        log_every_n_steps=10,
         callbacks=[
-            SetSamplerEpoch()
+            #SetSamplerEpoch()
         ]
     )
     trainer.fit(
