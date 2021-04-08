@@ -439,7 +439,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class Noam(object):
+class Noam(torch.optim.Optimizer):
     """
     Implements Noam optimizer. Proposed in "Attention Is All You Need", https://arxiv.org/pdf/1706.03762.pdf
     Modified from https://github.com/espnet/espnet/blob/master/espnet/nets/pytorch_backend/transformer/optimizer.py
@@ -465,14 +465,14 @@ class Noam(object):
         """Return param_groups."""
         return self.optimizer.param_groups
 
-    def step(self):
+    def step(self, closure=None):
         """Update parameters and rate."""
         self._step += 1
         rate = self.rate()
         for p in self.optimizer.param_groups:
             p["lr"] = rate
         self._rate = rate
-        self.optimizer.step()
+        self.optimizer.step(closure=closure)
 
     def rate(self, step=None):
         """Implement `lrate` above."""

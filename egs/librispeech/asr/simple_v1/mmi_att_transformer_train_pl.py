@@ -33,7 +33,6 @@ class LightningWrapper(pl.LightningModule):
     def __init__(self, model: AcousticModel, loss_fn: nn.Module, args: argparse.Namespace):
         super().__init__()
         self.automatic_optimization = False
-        #self.save_hyperparameters()
         self.model = model
         self.loss_fn = loss_fn
         self.args = args
@@ -84,12 +83,6 @@ class LightningWrapper(pl.LightningModule):
                 loss = (- (1.0 - self.args.att_rate) * mmi_loss + self.args.att_rate * att_loss) / len(texts)
             else:
                 loss = (-mmi_loss) / len(texts)
-
-            self.manual_backward(loss)
-            optim,  = self.optimizers(use_pl_optimizer=False)
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), 5.0)
-            optim.step()
-            optim.zero_grad()
 
             self.loss_fn.P.set_scores_stochastic_(self.model.P_scores)
             # loss.backward()
@@ -150,7 +143,7 @@ class LightningWrapper(pl.LightningModule):
                          model_size=self.args.attention_dim,
                          factor=1.0,
                          warm_step=self.args.warm_step)
-        return {'optimizer': optimizer}
+        return optimizer
 
 
 def get_parser():
@@ -304,6 +297,7 @@ def main():
         resume_from_checkpoint=exp_dir / 'last.pt',
         replace_sampler_ddp=False,
         log_every_n_steps=10,
+        gradient_clip_val=5.0,
         callbacks=[
             #SetSamplerEpoch()
         ]
