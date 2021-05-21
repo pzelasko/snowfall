@@ -360,100 +360,6 @@ def get_objf(batch: Dict,
     return ans
 
 
-def get_objf(batch: Dict,
-             model: AcousticModel,
-             ali_model: Optional[AcousticModel],
-             P: k2.Fsa,
-             device: torch.device,
-             graph_compiler: MmiTrainingGraphCompiler,
-             is_training: bool,
-             is_update: bool,
-             accum_grad: int = 1,
-             den_scale: float = 1.0,
-             att_rate: float = 0.0,
-             tb_writer: Optional[SummaryWriter] = None,
-             global_batch_idx_train: Optional[int] = None,
-             optimizer: Optional[torch.optim.Optimizer] = None,
-             scaler: GradScaler = None
-             ):
-    feature = batch['inputs']
-    # at entry, feature is [N, T, C]
-    feature = feature.permute(0, 2, 1)  # now feature is [N, C, T]
-    assert feature.ndim == 3
-    feature = feature.to(device)
-
-    supervisions = batch['supervisions']
-    supervision_segments, texts = encode_supervisions(supervisions)
-
-    loss_fn = LFMMILoss(
-        graph_compiler=graph_compiler,
-        P=P,
-        den_scale=den_scale
-    )
-
-    grad_context = nullcontext if is_training else torch.no_grad
-
-    with autocast(enabled=scaler.is_enabled()), grad_context():
-        nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
-        if att_rate != 0.0:
-            att_loss = model.module.decoder_forward(encoder_memory, memory_mask, supervisions, graph_compiler)
-
-        if (ali_model is not None and global_batch_idx_train is not None and
-                global_batch_idx_train // accum_grad < 4000):
-            with torch.no_grad():
-                ali_model_output = ali_model(feature)
-            # subsampling is done slightly differently, may be small length
-            # differences.
-            min_len = min(ali_model_output.shape[2], nnet_output.shape[2])
-            # scale less than one so it will be encouraged
-            # to mimic ali_model's output
-            ali_model_scale = 500.0 / (global_batch_idx_train // accum_grad + 500)
-            nnet_output = nnet_output.clone()  # or log-softmax backprop will fail.
-            nnet_output[:, :, :min_len] += ali_model_scale * ali_model_output[:, :, :min_len]
-
-        # nnet_output is [N, C, T]
-        nnet_output = nnet_output.permute(0, 2, 1)  # now nnet_output is [N, T, C]
-
-        mmi_loss, tot_frames, all_frames = loss_fn(nnet_output, texts, supervision_segments)
-
-    if is_training:
-        def maybe_log_gradients(tag: str):
-            if tb_writer is not None and global_batch_idx_train is not None and global_batch_idx_train % 200 == 0:
-                tb_writer.add_scalars(
-                    tag,
-                    measure_gradient_norms(model, norm='l1'),
-                    global_step=global_batch_idx_train
-                )
-
-        if att_rate != 0.0:
-            loss = (- (1.0 - att_rate) * mmi_loss + att_rate * att_loss) / (len(texts) * accum_grad)
-        else:
-            loss = (-mmi_loss) / (len(texts) * accum_grad)
-        scaler.scale(loss).backward()
-        if is_update:
-            maybe_log_gradients('train/grad_norms')
-            scaler.unscale_(optimizer)
-            clip_grad_value_(model.parameters(), 5.0)
-            maybe_log_gradients('train/clipped_grad_norms')
-            if tb_writer is not None and (global_batch_idx_train // accum_grad) % 200 == 0:
-                # Once in a time we will perform a more costly diagnostic
-                # to check the relative parameter change per minibatch.
-                deltas = optim_step_and_measure_param_change(model, optimizer, scaler)
-                tb_writer.add_scalars(
-                    'train/relative_param_change_per_minibatch',
-                    deltas,
-                    global_step=global_batch_idx_train
-                )
-            else:
-                scaler.step(optimizer)
-            optimizer.zero_grad()
-            scaler.update()
-
-    ans = -mmi_loss.detach().cpu().item(), tot_frames.cpu().item(
-    ), all_frames.cpu().item()
-    return ans
-
-
 def get_validation_objf(dataloader: torch.utils.data.DataLoader,
                         model: AcousticModel,
                         ali_model: Optional[AcousticModel],
@@ -462,6 +368,7 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
                         graph_compiler: MmiTrainingGraphCompiler,
                         scaler: GradScaler,
                         den_scale: float = 1,
+                        args=None,
                         ):
     total_objf = 0.
     total_frames = 0.  # for display only
@@ -481,7 +388,8 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
             is_training=False,
             is_update=False,
             den_scale=den_scale,
-            scaler=scaler
+            scaler=scaler,
+            args=args
         )
         total_objf += objf
         total_frames += frames
@@ -506,7 +414,8 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                     num_epochs: int,
                     global_batch_idx_train: int,
                     world_size: int,
-                    scaler: GradScaler
+                    scaler: GradScaler,
+                    args=None,
                     ):
     """One epoch training and validation.
 
@@ -570,7 +479,8 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
             tb_writer=tb_writer,
             global_batch_idx_train=global_batch_idx_train,
             optimizer=optimizer,
-            scaler=scaler
+            scaler=scaler,
+            args=args,
         )
 
         total_objf += curr_batch_objf
@@ -610,7 +520,9 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                 P=P,
                 device=device,
                 graph_compiler=graph_compiler,
-                scaler=scaler)
+                scaler=scaler,
+                args=args,
+                )
             if world_size > 1:
                 s = torch.tensor([
                     total_valid_objf, total_valid_frames,
@@ -960,7 +872,8 @@ def run(rank, world_size, args):
             num_epochs=num_epochs,
             global_batch_idx_train=global_batch_idx_train,
             world_size=world_size,
-            scaler=scaler
+            scaler=scaler,
+            args=args,
         )
         # the lower, the better
         if valid_objf < best_valid_objf:
