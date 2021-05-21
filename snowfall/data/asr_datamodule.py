@@ -6,7 +6,8 @@ from typing import List, Union
 from torch.utils.data import DataLoader
 
 from lhotse import Fbank, FbankConfig, load_manifest
-from lhotse.dataset import BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, SingleCutSampler, \
+from lhotse.dataset import AudioSamples, BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, \
+    RandomizedSmoothing, SingleCutSampler, \
     SpecAugment
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
 from snowfall.common import str2bool
@@ -86,6 +87,18 @@ class AsrDataModule(DataModule):
             help='When enabled, use on-the-fly cut mixing and feature extraction. '
                  'Will drop existing precomputed feature manifests if available.'
         )
+        group.add_argument(
+            '--raw-audio',
+            type=str2bool,
+            default=False,
+            help='When enabled, return audio waveforms from the DataLoader.'
+        )
+        group.add_argument(
+            '--use-rand-smooth',
+            type=str2bool,
+            default=False,
+            help='When enabled, use randomized smoothing (additive gaussian noise to the waveform).'
+        )
 
     def train_dataloaders(self) -> DataLoader:
         logging.info("About to get train cuts")
@@ -108,31 +121,59 @@ class AsrDataModule(DataModule):
                              )
                          ] + transforms
 
-        input_transforms = [
-            SpecAugment(num_frame_masks=2, features_mask_size=27, num_feature_masks=2, frames_mask_size=100)
-        ]
-
-        train = K2SpeechRecognitionDataset(
-            cuts_train,
-            cut_transforms=transforms,
-            input_transforms=input_transforms
+        smoothing = RandomizedSmoothing(
+            sigma=[
+                (0, 0.0),
+                (1000, 0.001),
+                (2000, 0.01),
+                (5000, 0.1),
+                (10000, 0.2),
+                (20000, 0.3),
+            ],
+            sample_sigma=True,
+            p=0.66
         )
 
-        if self.args.on_the_fly_feats:
-            # NOTE: the PerturbSpeed transform should be added only if we remove it from data prep stage.
-            # # Add on-the-fly speed perturbation; since originally it would have increased epoch
-            # # size by 3, we will apply prob 2/3 and use 3x more epochs.
-            # # Speed perturbation probably should come first before concatenation,
-            # # but in principle the transforms order doesn't have to be strict (e.g. could be randomized)
-            # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2 / 3)] + transforms
-            # Drop feats to be on the safe side.
-            cuts_train = cuts_train.drop_features()
+        if self.args.raw_audio:
+            input_transforms = []
+            if self.args.use_rand_smooth:
+                input_transforms.append(smoothing)
+
             train = K2SpeechRecognitionDataset(
                 cuts=cuts_train,
                 cut_transforms=transforms,
-                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))),
+                input_strategy=AudioSamples(),
                 input_transforms=input_transforms
             )
+        else:
+            input_transforms = [
+                SpecAugment(num_frame_masks=2, features_mask_size=27, num_feature_masks=2, frames_mask_size=100)
+            ]
+
+            if self.args.on_the_fly_feats:
+                # NOTE: the PerturbSpeed transform should be added only if we remove it from data prep stage.
+                # # Add on-the-fly speed perturbation; since originally it would have increased epoch
+                # # size by 3, we will apply prob 2/3 and use 3x more epochs.
+                # # Speed perturbation probably should come first before concatenation,
+                # # but in principle the transforms order doesn't have to be strict (e.g. could be randomized)
+                # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2 / 3)] + transforms
+                # Drop feats to be on the safe side.
+                cuts_train = cuts_train.drop_features()
+                train = K2SpeechRecognitionDataset(
+                    cuts=cuts_train,
+                    cut_transforms=transforms,
+                    input_strategy=OnTheFlyFeatures(
+                        extractor=Fbank(FbankConfig(num_mel_bins=80)),
+                        wave_transforms=[smoothing] if self.args.use_rand_smooth else []
+                    ),
+                    input_transforms=input_transforms
+                )
+            else:
+                train = K2SpeechRecognitionDataset(
+                    cuts_train,
+                    cut_transforms=transforms,
+                    input_transforms=input_transforms
+                )
 
         if self.args.bucketing_sampler:
             logging.info('Using BucketingSampler.')
@@ -163,13 +204,12 @@ class AsrDataModule(DataModule):
         logging.info("About to get dev cuts")
         cuts_valid = self.valid_cuts()
 
-        transforms = [ ]
+        transforms = []
         if self.args.concatenate_cuts:
-            transforms = [ CutConcatenate(
-                                 duration_factor=self.args.duration_factor,
-                                 gap=self.args.gap)
-                          ] + transforms
-
+            transforms = [CutConcatenate(
+                duration_factor=self.args.duration_factor,
+                gap=self.args.gap)
+                         ] + transforms
 
         logging.info("About to create dev dataset")
         if self.args.on_the_fly_feats:
