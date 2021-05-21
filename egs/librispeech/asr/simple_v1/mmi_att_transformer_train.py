@@ -656,6 +656,8 @@ def main():
     mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
 
 
+logging.info = print
+
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 

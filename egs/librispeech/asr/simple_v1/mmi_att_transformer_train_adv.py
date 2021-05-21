@@ -781,6 +781,13 @@ def get_parser():
         help='Path to a pre-trained checkpoint. '
              'Overrides start_epoch etc. settings.'
     )
+    parser.add_argument(
+        '--discard-trainer-state',
+        type=str2bool,
+        default=False,
+        help='Discards optimier, LR scheduler, grad scaler states '
+             'if they are present in the checkpoint.'
+    )
     return parser
 
 
@@ -806,7 +813,7 @@ def run(rank, world_size, args):
     fix_random_seed(42)
     setup_dist(rank, world_size, args.master_port)
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg')
+    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv))
     setup_logger(f'{exp_dir}/log/log-train-{rank}')
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
@@ -912,17 +919,21 @@ def run(rank, world_size, args):
     best_epoch_info_filename = os.path.join(exp_dir, 'best-epoch-info')
     global_batch_idx_train = 0  # for logging only
 
-    if start_epoch > 0:
+    if start_epoch > 0 or args.fine_tune_mdl:
         model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(start_epoch - 1))
         if args.fine_tune_mdl:
             model_path = args.fine_tune_mdl
             logging.info(f'Reading pre-trained model from {model_path} for fine-tuning. '
                          f'You can use --start-epoch to control the learning rate schedule...')
-        ckpt = load_checkpoint(filename=model_path, model=model, optimizer=optimizer, scaler=scaler)
-        best_objf = ckpt['objf']
-        best_valid_objf = ckpt['valid_objf']
-        global_batch_idx_train = ckpt['global_batch_idx_train']
-        logging.info(f"epoch = {ckpt['epoch']}, objf = {best_objf}, valid_objf = {best_valid_objf}")
+        if args.discard_trainer_state:
+            ckpt = load_checkpoint(filename=model_path, model=model)
+        else:
+            ckpt = load_checkpoint(filename=model_path, model=model, optimizer=optimizer, scaler=scaler)
+        if all(x in ckpt for x in 'objf valid_objf global_batch_idx_train epoch best_objf best_balid_objf'.split()):
+            best_objf = ckpt['objf']
+            best_valid_objf = ckpt['valid_objf']
+            global_batch_idx_train = ckpt['global_batch_idx_train']
+            logging.info(f"epoch = {ckpt['epoch']}, objf = {best_objf}, valid_objf = {best_valid_objf}")
 
     for epoch in range(start_epoch, num_epochs):
         train_dl.sampler.set_epoch(epoch)
@@ -1019,6 +1030,8 @@ def main():
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+
+logging.info = print
 
 if __name__ == '__main__':
     main()
