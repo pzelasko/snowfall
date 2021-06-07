@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import List
 from typing import Union
 
+from lhotse.features.kaldi.layers import Wav2LogFilterBank
+from lhotse.utils import compute_num_frames
+
 from snowfall.common import average_checkpoint, store_transcripts
 from snowfall.common import find_first_disambig_symbol
 from snowfall.common import get_texts
@@ -40,9 +43,21 @@ def decode(dataloader: torch.utils.data.DataLoader, model: AcousticModel,
     tot_num_cuts = len(dataloader.dataset.cuts)
     num_cuts = 0
     results = []  # a list of pair (ref_words, hyp_words)
+    fbank = Wav2LogFilterBank().to(device)
     for batch_idx, batch in enumerate(dataloader):
-        feature = batch['inputs']
+        #feature = fbank(batch['inputs'].to(device))
+        feature = batch['inputs'].to(device)
+        
         supervisions = batch['supervisions']
+        #supervisions['start_frame'] = torch.LongTensor([
+        #    compute_num_frames(sample.item() / 16000, fbank.frame_shift, 16000)
+        #    for sample in supervisions['start_sample']
+        #])
+        #supervisions['num_frames'] = torch.LongTensor([
+        #    compute_num_frames(sample.item() / 16000, fbank.frame_shift, 16000)
+        #    for sample in supervisions['num_samples']
+        #])
+        
         supervision_segments = torch.stack(
             (supervisions['sequence_idx'],
              (((supervisions['start_frame'] - 1) // 2 - 1) // 2),
@@ -53,7 +68,7 @@ def decode(dataloader: torch.utils.data.DataLoader, model: AcousticModel,
         texts = supervisions['text']
         assert feature.ndim == 3
 
-        feature = feature.to(device)
+        #feature = feature.to(device)
         # at entry, feature is [N, T, C]
         feature = feature.permute(0, 2, 1)  # now feature is [N, C, T]
         with torch.no_grad():
@@ -242,7 +257,9 @@ def main():
 
     output_beam_size = args.output_beam_size
 
-    exp_dir = Path('exp-' + model_type + '-mmi-att-sa-vgg-normlayer')
+    #exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg')
+    #exp_dir = Path('exp-conformer-noam-mmi-att-musan-sa-vgg-adv-pgd-3')
+    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-librosa')
     setup_logger('{}/log/log-decode'.format(exp_dir), log_level='debug')
 
     logging.info(f'output_beam_size: {output_beam_size}')
@@ -286,7 +303,7 @@ def main():
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers,
             vgg_frontend=True,
-            is_espnet_structure=True)
+            is_espnet_structure=False)
     elif model_type == "contextnet":
         model = ContextNet(
         num_features=80,

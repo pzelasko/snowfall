@@ -6,6 +6,7 @@ from typing import List, Union
 from torch.utils.data import DataLoader
 
 from lhotse import Fbank, FbankConfig, load_manifest
+from lhotse import LibrosaFbank, LibrosaFbankConfig
 from lhotse.dataset import AudioSamples, BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, \
     RandomizedSmoothing, SingleCutSampler, \
     SpecAugment
@@ -99,6 +100,12 @@ class AsrDataModule(DataModule):
             default=False,
             help='When enabled, use randomized smoothing (additive gaussian noise to the waveform).'
         )
+        group.add_argument(
+            '--librosa',
+            type=str2bool,
+            default=False,
+            help='When enabled, use LibrosaFbank with sampling rate 22050Hz.'
+        )
 
     def train_dataloaders(self) -> DataLoader:
         logging.info("About to get train cuts")
@@ -106,6 +113,10 @@ class AsrDataModule(DataModule):
 
         logging.info("About to get Musan cuts")
         cuts_musan = load_manifest(self.args.feature_dir / 'cuts_musan.json.gz')
+        if self.args.librosa:
+            cuts_train = cuts_train.filter(lambda c: '_sp' not in c.id)
+            cuts_train = cuts_train.resample(22050)
+            cuts_musan = cuts_musan.resample(22050)
 
         logging.info("About to create train dataset")
         transforms = [CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20))]
@@ -156,14 +167,20 @@ class AsrDataModule(DataModule):
                 # # size by 3, we will apply prob 2/3 and use 3x more epochs.
                 # # Speed perturbation probably should come first before concatenation,
                 # # but in principle the transforms order doesn't have to be strict (e.g. could be randomized)
-                # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2 / 3)] + transforms
                 # Drop feats to be on the safe side.
                 cuts_train = cuts_train.drop_features()
+                if self.args.librosa:
+                    logging.info('Using LibrosaFbank')
+                    extractor = LibrosaFbank()
+                    #from lhotse.dataset import PerturbSpeed
+                    #transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2 / 3)] + transforms
+                else:
+                    extractor=Fbank(FbankConfig(num_mel_bins=80))
                 train = K2SpeechRecognitionDataset(
                     cuts=cuts_train,
                     cut_transforms=transforms,
                     input_strategy=OnTheFlyFeatures(
-                        extractor=Fbank(FbankConfig(num_mel_bins=80)),
+                        extractor=extractor,
                         wave_transforms=[smoothing] if self.args.use_rand_smooth else []
                     ),
                     input_transforms=input_transforms
@@ -203,6 +220,8 @@ class AsrDataModule(DataModule):
     def valid_dataloaders(self) -> DataLoader:
         logging.info("About to get dev cuts")
         cuts_valid = self.valid_cuts()
+        if self.args.librosa:
+            cuts_valid = cuts_valid.resample(22050)
 
         transforms = []
         if self.args.concatenate_cuts:
@@ -212,16 +231,27 @@ class AsrDataModule(DataModule):
                          ] + transforms
 
         logging.info("About to create dev dataset")
-        if self.args.on_the_fly_feats:
-            cuts_valid = cuts_valid.drop_features()
+        if self.args.raw_audio:
             validate = K2SpeechRecognitionDataset(
-                cuts_valid.drop_features(),
+                cuts_valid,
                 cut_transforms=transforms,
-                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
+                input_strategy=AudioSamples(),
             )
         else:
-            validate = K2SpeechRecognitionDataset(cuts_valid,
-                                                  cut_transforms=transforms)
+            if self.args.on_the_fly_feats:
+                if self.args.librosa:
+                    logging.info('Using LibrosaFbank')
+                    extractor = LibrosaFbank()
+                else:
+                    extractor=Fbank(FbankConfig(num_mel_bins=80))
+                validate = K2SpeechRecognitionDataset(
+                    cuts_valid.drop_features(),
+                    cut_transforms=transforms,
+                    input_strategy=OnTheFlyFeatures(extractor=extractor)
+                )
+            else:
+                validate = K2SpeechRecognitionDataset(cuts_valid,
+                                                      cut_transforms=transforms)
         valid_sampler = SingleCutSampler(
             cuts_valid,
             max_duration=self.args.max_duration,
@@ -246,10 +276,24 @@ class AsrDataModule(DataModule):
 
         for cuts_test in cuts:
             logging.debug("About to create test dataset")
-            test = K2SpeechRecognitionDataset(
-                cuts_test,
-                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
-            )
+            if self.args.librosa:
+                cuts_test = cuts_test.resample(22050)
+            if self.args.raw_audio:
+                test = K2SpeechRecognitionDataset(
+                    cuts_test,
+                    #input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
+                    input_strategy=AudioSamples()
+                )
+            else:
+                if self.args.librosa:
+                    logging.info('Using LibrosaFbank')
+                    extractor = LibrosaFbank()
+                else:
+                    extractor=Fbank(FbankConfig(num_mel_bins=80))
+                test = K2SpeechRecognitionDataset(
+                    cuts_test,
+                    input_strategy=OnTheFlyFeatures(extractor=extractor)
+                )
             sampler = SingleCutSampler(cuts_test, max_duration=self.args.max_duration)
             logging.debug("About to create test dataloader")
             test_dl = DataLoader(test, batch_size=None, sampler=sampler, num_workers=1)

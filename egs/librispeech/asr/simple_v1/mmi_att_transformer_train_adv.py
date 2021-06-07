@@ -13,12 +13,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from dataclasses import asdict
 
 import k2
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torchaudio
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -26,6 +28,8 @@ from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from lhotse.features.fbank import FbankConfig
+from lhotse.utils import compute_num_frames
 from lhotse.utils import fix_random_seed, nullcontext
 from snowfall.common import describe, str2bool
 from snowfall.common import load_checkpoint, save_checkpoint
@@ -45,47 +49,32 @@ from snowfall.training.diagnostics import measure_gradient_norms, optim_step_and
 from snowfall.training.mmi_graph import MmiTrainingGraphCompiler
 from snowfall.training.mmi_graph import create_bigram_phone_lm
 
+from lhotse.features.kaldi.layers import Wav2LogFilterBank
 
 def feature_extraction(
         x: torch.Tensor,
+        extractor: nn.Module,
         supervisions: dict = None,
-        compute_gradient: bool = False
+        compute_gradient: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Do feature extraction and return feature, supervisions
     """
-    from dataclasses import asdict
-    from lhotse.features.fbank import FbankConfig
-    from lhotse.utils import compute_num_frames
-    import torchaudio
-
-    params = asdict(FbankConfig())
-    params.update({
-        "sample_frequency": 16000,
-        "num_mel_bins": 80,
-        "snip_edges": False
-    })
-    params['frame_shift'] *= 1000.0
-    params['frame_length'] *= 1000.0
 
     if compute_gradient:
         x.requires_grad = True
-    ### start feature extraction
-    features_single = []
-    for i in range(x.shape[0]):
-        feature_i = torchaudio.compliance.kaldi.fbank(x[i].unsqueeze(0), **params)  # [T, C]
-        features_single.append(feature_i)
-    feature = torch.stack(features_single)
+
+    feature = extractor(x)
 
     if supervisions is not None:
         start_frames = [
-            compute_num_frames(sample.item() / 16000, params['frame_shift'] / 1000, 16000)
+            compute_num_frames(sample.item() / 16000, extractor.frame_shift, 16000)
             for sample in supervisions['start_sample']
         ]
         supervisions['start_frame'] = torch.LongTensor(start_frames)
 
         num_frames = [
-            compute_num_frames(sample.item() / 16000, params['frame_shift'] / 1000, 16000)
+            compute_num_frames(sample.item() / 16000, extractor.frame_shift, 16000)
             for sample in supervisions['num_samples']
         ]
         supervisions['num_frames'] = torch.LongTensor(num_frames)
@@ -106,42 +95,18 @@ def forward_pass(feature,
                  graph_compiler,
                  is_training,
                  global_batch_idx_train,
-                 scaler):
-    feature = feature.to(device)
-    # at entry, feature is [N, T, C]
+                 scaler, 
+                 loss_fn,
+                 ):
     feature = feature.permute(0, 2, 1)  # now feature is [N, C, T]
-
-    loss_fn = LFMMILoss(
-        graph_compiler=graph_compiler,
-        P=P,
-        den_scale=den_scale
-    )
     grad_context = nullcontext if is_training else torch.no_grad
     with autocast(enabled=scaler.is_enabled()), grad_context():
         nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
-        if att_rate != 0.0:
-            att_loss = model.decoder_forward(encoder_memory, memory_mask, supervisions, graph_compiler)
-        if (ali_model is not None and global_batch_idx_train is not None and
-                global_batch_idx_train < 4000):
-            with torch.no_grad():
-                ali_model_output = ali_model(feature)[0]
-            ali_model_scale = 500.0 / (global_batch_idx_train + 500)
-            nnet_output = nnet_output.clone()  # or log-softmax backprop will fail.
-            nnet_output += ali_model_scale * ali_model_output
-
     # nnet_output is [N, C, T]
     nnet_output = nnet_output.permute(0, 2, 1)  # now nnet_output is [N, T, C]
-
     mmi_loss, tot_frames, all_frames = loss_fn(nnet_output, texts, supervision_segments)
-
-    # dense_fsa_vec = k2.DenseFsaVec(nnet_output, supervision_segments)
-    assert nnet_output.device == device
-
-    if att_rate != 0.0:
-        loss = (- (1.0 - att_rate) * mmi_loss + att_rate * att_loss) / (len(texts))
-    else:
-        loss = (-mmi_loss) / (len(texts))
-
+    assert nnet_output.device == device, f'{nnet_output.device} != {device}'
+    loss = (-mmi_loss) / (len(texts))
     return loss, tot_frames, all_frames
 
 
@@ -159,9 +124,12 @@ def fgsm_attack(audio,
                 is_training,
                 global_batch_idx_train,
                 scaler,
+                loss_fn,
+                feat_extractor,
                 eps=0.01):
+    audio = audio.clone().to(device)
     eps = eps * audio.detach().abs().max().data
-    feature, _ = feature_extraction(audio, compute_gradient=True)
+    feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=True)
     loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                 supervision_segments,
                                                 texts, P, model,
@@ -170,10 +138,11 @@ def fgsm_attack(audio,
                                                 att_rate, graph_compiler,
                                                 is_training,
                                                 global_batch_idx_train,
-                                                scaler)
-    loss.backward()  # to get input gradients
+                                                scaler, loss_fn)
+    scaler.scale(loss).backward()  # to get input gradients
     assert audio.grad is not None
     audio_adv = audio + audio.grad.data.sign() * eps
+    audio_adv = torch.clamp(audio_adv, min=-1.0, max=1.0)
     audio = audio_adv.detach()
     return audio
 
@@ -192,18 +161,22 @@ def pgd_attack(audio,
                is_training,
                global_batch_idx_train,
                scaler,
+               loss_fn,
+               feat_extractor,
                eps=0.01,
-               alpha=0.002,
                iters=7,
                rand_prob=0.8):
+    audio = audio.clone().to(device)
     audio_ori = audio
     eps = eps * audio.detach().abs().max().data
-    alpha = alpha * audio.detach().abs().max().data
+    # 1.5 is a magic number to make it more likely for PGD to actually
+    # reach the given epsilon for some samples
+    alpha = 1.5 * (1 / iters) * audio.detach().abs().max().data
     if torch.rand(1) < rand_prob:
         rand_pert = torch.rand_like(audio) * 2 * eps - eps
         audio = audio + rand_pert
     for i in range(iters):
-        feature, _ = feature_extraction(audio, compute_gradient=True)
+        feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=True)
         loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                     supervision_segments,
                                                     texts, P, model,
@@ -211,12 +184,14 @@ def pgd_attack(audio,
                                                     device, den_scale,
                                                     att_rate, graph_compiler,
                                                     is_training,
-                                                    global_batch_idx_train, scaler)
-        loss.backward()  # to get input gradients
+                                                    global_batch_idx_train, scaler, loss_fn)
+        scaler.scale(loss).backward()  # to get input gradients
         assert audio.grad is not None
         audio_adv = audio + audio.grad.data.sign() * alpha
         eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
-        audio = (audio_ori + eta).detach()
+        audio = (audio_ori + eta)
+        audio = torch.clamp(audio, min=-1.0, max=1.0)
+        audio = audio.detach()
 
     return audio
 
@@ -229,6 +204,7 @@ def get_objf(batch: Dict,
              graph_compiler: MmiTrainingGraphCompiler,
              is_training: bool,
              is_update: bool,
+             feat_extractor: nn.Module,
              accum_grad: int = 1,
              den_scale: float = 1.0,
              att_rate: float = 0.0,
@@ -237,9 +213,9 @@ def get_objf(batch: Dict,
              optimizer: Optional[torch.optim.Optimizer] = None,
              scaler: Optional[GradScaler] = None,
              args=None):
-    audio = batch['inputs']
+    audio = batch['inputs'].clone().to(device)
     supervisions = batch['supervisions']
-    _, supervisions = feature_extraction(audio, supervisions)
+    _, supervisions = feature_extraction(audio, feat_extractor, supervisions, compute_gradient=False)
     supervision_segments = torch.stack(
         (supervisions['sequence_idx'],
          (((supervisions['start_frame'] - 1) // 2 - 1) // 2),
@@ -250,6 +226,12 @@ def get_objf(batch: Dict,
 
     texts = supervisions['text']
     texts = [texts[idx] for idx in indices]
+
+    loss_fn = LFMMILoss(
+        graph_compiler=graph_compiler,
+        P=P,
+        den_scale=den_scale
+    )
 
     if is_training:
         # adversarial attack block
@@ -263,7 +245,8 @@ def get_objf(batch: Dict,
                                     att_rate, graph_compiler,
                                     is_training,
                                     global_batch_idx_train,
-                                    scaler,
+                                    scaler, loss_fn,
+                                    feat_extractor,
                                     eps=args.fgsm_eps)
                 optimizer.zero_grad()  # clean up gradients in model that were generated from adversary
 
@@ -276,9 +259,9 @@ def get_objf(batch: Dict,
                                    att_rate, graph_compiler,
                                    is_training,
                                    global_batch_idx_train,
-                                   scaler,
+                                   scaler, loss_fn,
+                                   feat_extractor,
                                    eps=args.pgd_eps,
-                                   alpha=args.pgd_alpha,
                                    iters=args.pgd_iter,
                                    rand_prob=args.pgd_rand_prob)
                 optimizer.zero_grad()  # clean up gradients in model that were generated from adversary
@@ -292,13 +275,13 @@ def get_objf(batch: Dict,
                                        att_rate, graph_compiler,
                                        is_training,
                                        global_batch_idx_train,
-                                       scaler,
+                                       scaler, loss_fn,
+                                       feat_extractor,
                                        eps=args.pgd_eps,
-                                       alpha=args.pgd_alpha,
                                        iters=args.pgd_iter,
                                        rand_prob=args.pgd_rand_prob)
                 optimizer.zero_grad()  # clean up gradients in model that were generated from adversary
-                feature_adv, _ = feature_extraction(audio_adv)
+                feature_adv, _ = feature_extraction(audio_adv, feat_extractor)
                 loss, tot_frames, all_frames = forward_pass(feature_adv, supervisions,
                                                             supervision_segments,
                                                             texts, P, model,
@@ -307,12 +290,12 @@ def get_objf(batch: Dict,
                                                             att_rate, graph_compiler,
                                                             is_training,
                                                             global_batch_idx_train,
-                                                            scaler,
+                                                            scaler, loss_fn
                                                             )
-                loss.backward()
+                scaler.scale(loss).backward()
 
     # forward and backward for paramters update
-    feature, _ = feature_extraction(audio)
+    feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=False)
     loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                 supervision_segments,
                                                 texts, P, model,
@@ -321,7 +304,7 @@ def get_objf(batch: Dict,
                                                 att_rate, graph_compiler,
                                                 is_training,
                                                 global_batch_idx_train,
-                                                scaler,
+                                                scaler, loss_fn
                                                 )
     if is_training:
 
@@ -355,8 +338,7 @@ def get_objf(batch: Dict,
             optimizer.zero_grad()
             scaler.update()
 
-    ans = loss.detach().cpu().item(), tot_frames.cpu().item(
-    ), all_frames.cpu().item()
+    ans = loss.detach().cpu().item(), tot_frames.cpu().item(), all_frames.cpu().item()
     return ans
 
 
@@ -367,6 +349,7 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
                         device: torch.device,
                         graph_compiler: MmiTrainingGraphCompiler,
                         scaler: GradScaler,
+                        feat_extractor: nn.Module,
                         den_scale: float = 1,
                         args=None,
                         ):
@@ -387,6 +370,7 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
             graph_compiler=graph_compiler,
             is_training=False,
             is_update=False,
+            feat_extractor=feat_extractor,
             den_scale=den_scale,
             scaler=scaler,
             args=args
@@ -446,6 +430,8 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
     time_waiting_for_batch = 0
     forward_count = 0
     prev_timestamp = datetime.now()
+    
+    fbank = Wav2LogFilterBank().to(device)
 
     model.train()
     for batch_idx, batch in enumerate(dataloader):
@@ -473,6 +459,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
             graph_compiler=graph_compiler,
             is_training=True,
             is_update=is_update,
+            feat_extractor=fbank,
             accum_grad=accum_grad,
             den_scale=den_scale,
             att_rate=att_rate,
@@ -521,6 +508,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                 device=device,
                 graph_compiler=graph_compiler,
                 scaler=scaler,
+                feat_extractor=fbank,
                 args=args,
                 )
             if world_size > 1:
@@ -675,12 +663,6 @@ def get_parser():
         help='PGD attack eps'
     )
     parser.add_argument(
-        '--pgd-alpha',
-        type=float,
-        default=0.0,
-        help='PGD attack alpha'
-    )
-    parser.add_argument(
         '--pgd-rand-prob',
         type=float,
         default=0.8,
@@ -725,7 +707,7 @@ def run(rank, world_size, args):
     fix_random_seed(42)
     setup_dist(rank, world_size, args.master_port)
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv))
+    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv) + '-3')
     setup_logger(f'{exp_dir}/log/log-train-{rank}')
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')

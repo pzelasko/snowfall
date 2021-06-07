@@ -541,7 +541,7 @@ def run(rank, world_size, args):
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers,
             vgg_frontend=True,
-            is_espnet_structure=True)
+            is_espnet_structure=False)
     elif model_type == "contextnet":
         model = ContextNet(
             num_features=80,
