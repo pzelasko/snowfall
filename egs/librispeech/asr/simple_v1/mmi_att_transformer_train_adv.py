@@ -9,6 +9,7 @@
 import argparse
 import logging
 import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -166,12 +167,15 @@ def pgd_attack(audio,
                eps=0.01,
                iters=7,
                rand_prob=0.8):
+    from scipy.stats import loguniform
     audio = audio.clone().to(device)
     audio_ori = audio
+    eps = loguniform.rvs(eps / 100, eps * 2, size=1)[0].item()
     eps = eps * audio.detach().abs().max().data
+    iters = random.randint(1, iters)
     # 1.5 is a magic number to make it more likely for PGD to actually
     # reach the given epsilon for some samples
-    alpha = 1.5 * (1 / iters) * audio.detach().abs().max().data
+    alpha = 1.5 * (eps / iters) * audio.detach().abs().max().data
     if torch.rand(1) < rand_prob:
         rand_pert = torch.rand_like(audio) * 2 * eps - eps
         audio = audio + rand_pert
@@ -707,7 +711,7 @@ def run(rank, world_size, args):
     fix_random_seed(42)
     setup_dist(rank, world_size, args.master_port)
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv) + '-3')
+    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv) + '-4')
     setup_logger(f'{exp_dir}/log/log-train-{rank}')
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
